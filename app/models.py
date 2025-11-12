@@ -181,6 +181,33 @@ class ItemMedia(db.Model):
             data['url'] = self.url
         return data
 
+
+class ClaimMedia(db.Model):
+    __tablename__ = 'claim_media'
+
+    id = db.Column(db.Integer, primary_key=True)
+    claim_id = db.Column(db.Integer, db.ForeignKey('claims.id'), nullable=False, index=True)
+    media_type = db.Column(db.String(10), nullable=False)  # 'image' or 'video'
+    url = db.Column(db.String(500), nullable=False)
+    preview_url = db.Column(db.String(500), nullable=False)
+    public_id = db.Column(db.String(255), nullable=True)
+    format = db.Column(db.String(50), nullable=True)
+    is_primary = db.Column(db.Boolean, default=False, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    def to_dict(self, include_secure=False):
+        data = {
+            'id': self.id,
+            'media_type': self.media_type,
+            'preview_url': self.preview_url,
+            'is_primary': self.is_primary,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'format': self.format,
+        }
+        if include_secure:
+            data['url'] = self.url
+        return data
+
 class Claim(db.Model):
     __tablename__ = 'claims'
     
@@ -194,6 +221,13 @@ class Claim(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     
+    media = db.relationship(
+        'ClaimMedia',
+        backref='claim',
+        lazy='dynamic',
+        cascade="all, delete-orphan"
+    )
+
     # Relationships
     # Helper method to get the related item (LostItem or FoundItem)
     def get_item(self):
@@ -207,6 +241,15 @@ class Claim(db.Model):
     def to_dict(self, include_secure_media=False):
         """Convert claim to dictionary"""
         item = self.get_item()
+        claim_media = []
+        if self.media is not None:
+            claim_media = [
+                media.to_dict(include_secure=include_secure_media)
+                for media in self.media.order_by(
+                    ClaimMedia.is_primary.desc(),
+                    ClaimMedia.created_at.asc()
+                ).all()
+            ]
         return {
             'id': self.id,
             'item_id': self.item_id,
@@ -223,6 +266,14 @@ class Claim(db.Model):
             'item_image_url': item.image_url if item else None,
             'item_status': item.status if item else None,
             'item_media': [
+                media.to_dict(include_secure=include_secure_media)
+                for media in (item.media.order_by(
+                    ItemMedia.is_primary.desc(),
+                    ItemMedia.created_at.asc()
+                ).all() if item and hasattr(item, 'media') and item.media is not None else [])
+            ] if item else [],
+            'claim_media': claim_media,
+            'media': claim_media if claim_media else [
                 media.to_dict(include_secure=include_secure_media)
                 for media in (item.media.order_by(
                     ItemMedia.is_primary.desc(),

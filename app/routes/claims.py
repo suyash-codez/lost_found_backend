@@ -1,12 +1,13 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app import db, limiter
-from app.models import Claim, LostItem, FoundItem, User
+from app.models import Claim, LostItem, FoundItem, User, ClaimMedia
 from datetime import datetime
 from app.utils.validators import (
     validate_integer, validate_enum, validate_string_field,
     sanitize_input
 )
+from app.utils.cloudinary_client import upload_media
 
 claims_bp = Blueprint('claims', __name__)
 
@@ -16,7 +17,10 @@ claims_bp = Blueprint('claims', __name__)
 def create_claim():
     """Create a new claim (requires JWT authentication)"""
     try:
-        data = request.get_json()
+        if request.content_type and 'multipart/form-data' in request.content_type:
+            data = request.form.to_dict()
+        else:
+            data = request.get_json()
         identity = get_jwt_identity()
         try:
             claimer_id = int(identity)
@@ -35,6 +39,15 @@ def create_claim():
         item_id = data.get('item_id')
         item_type = sanitize_input(data.get('item_type'))  # 'lost' or 'found'
         verification_details = sanitize_input(data.get('verification_details'))
+        proof_images = []
+        proof_video = None
+
+        if request.files:
+            if 'proof_images' in request.files:
+                proof_images = request.files.getlist('proof_images')
+            elif 'proof_media' in request.files:
+                proof_images = request.files.getlist('proof_media')
+            proof_video = request.files.get('proof_video')
         
         # Validate required fields
         if not item_id or not item_type:
@@ -74,6 +87,13 @@ def create_claim():
                 'success': False,
                 'error': f'{item_type.capitalize()} item not found'
             }), 404
+
+        # Require at least one piece of proof media
+        if not proof_images and not proof_video:
+            return jsonify({
+                'success': False,
+                'error': 'Please provide at least one proof image or video'
+            }), 400
         
         # Check if item is already claimed/closed
         if item.status in ['claimed', 'closed']:
@@ -106,6 +126,57 @@ def create_claim():
         )
         
         db.session.add(claim)
+        db.session.flush()
+
+        primary_media_set = False
+
+        for index, file in enumerate(proof_images or []):
+            if not file:
+                continue
+
+            ok, upload = upload_media(
+                file_stream=file,
+                folder="lost_found_app/claims/images",
+                resource_type="image"
+            )
+            if not ok:
+                db.session.rollback()
+                return jsonify({'success': False, 'error': f'Image upload failed: {upload}'}), 400
+
+            media = ClaimMedia(
+                claim_id=claim.id,
+                media_type='image',
+                url=upload['url'],
+                preview_url=upload['preview_url'],
+                public_id=upload['public_id'],
+                format=upload['format'],
+                is_primary=not primary_media_set
+            )
+            primary_media_set = True
+            db.session.add(media)
+
+        if proof_video:
+            ok, upload = upload_media(
+                file_stream=proof_video,
+                folder="lost_found_app/claims/video",
+                resource_type="video"
+            )
+            if not ok:
+                db.session.rollback()
+                return jsonify({'success': False, 'error': f'Video upload failed: {upload}'}), 400
+
+            media = ClaimMedia(
+                claim_id=claim.id,
+                media_type='video',
+                url=upload['url'],
+                preview_url=upload['preview_url'],
+                public_id=upload['public_id'],
+                format=upload['format'],
+                is_primary=not primary_media_set
+            )
+            primary_media_set = True
+            db.session.add(media)
+
         db.session.commit()
         
         return jsonify({
@@ -296,6 +367,26 @@ def verify_claim(claim_id):
         )
         if not is_valid:
             return jsonify({'success': False, 'error': error}), 400
+
+        if new_status == claim.status:
+            return jsonify({
+                'success': False,
+                'error': f'Claim is already {claim.status}'
+            }), 400
+
+        allowed_transitions = {
+            'pending': {'verified', 'returned', 'rejected'},
+            'verified': {'returned'},
+            'returned': set(),
+            'rejected': set(),
+        }
+
+        current_status = claim.status
+        if new_status not in allowed_transitions.get(current_status, set()):
+            return jsonify({
+                'success': False,
+                'error': f'Cannot transition claim from {current_status} to {new_status}'
+            }), 400
         
         # Validate verification_details if provided
         if verification_details:
@@ -305,13 +396,6 @@ def verify_claim(claim_id):
             )
             if not is_valid:
                 return jsonify({'success': False, 'error': error}), 400
-        
-        # Check if claim is already processed
-        if claim.status in ['verified', 'returned', 'rejected']:
-            return jsonify({
-                'success': False,
-                'error': f'Claim is already {claim.status}'
-            }), 400
         
         # Update claim status
         claim.status = new_status
