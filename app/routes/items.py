@@ -517,10 +517,13 @@ def get_found_items():
                 return jsonify({'success': False, 'error': error}), 400
         
         # Build query (SQL injection protected by SQLAlchemy ORM)
+        # By default, return ALL items regardless of status (available, claimed, closed)
+        # Only filter by status if explicitly requested via query parameter
         query = FoundItem.query
         
         if status:
             query = query.filter(FoundItem.status == status)
+        # If no status filter is provided, return all items including claimed and closed ones
         if category:
             query = query.filter(FoundItem.category.ilike(f'%{category}%'))
         if location:
@@ -538,6 +541,11 @@ def get_found_items():
         
         # Order by most recent first
         found_items = query.order_by(FoundItem.created_at.desc()).all()
+        
+        # Debug: Log item statuses to verify all items are being returned
+        print(f"Found items query returned {len(found_items)} items")
+        for item in found_items:
+            print(f"  Item ID {item.id}: {item.title} - Status: {item.status}")
         
         return jsonify({
             'success': True,
